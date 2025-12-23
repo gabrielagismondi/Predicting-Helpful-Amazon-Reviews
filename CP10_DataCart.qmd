@@ -1,0 +1,1581 @@
+---
+title: "KSB 620 Practicum: Amazon Reviews Analysis"
+author: "Team DataCart"
+date: today
+format: 
+  pdf:
+    code-overflow: wrap
+    titlepage: true
+    toc: true
+    toc-depth: 2
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: source
+---
+
+# Introduction
+
+Our project aims to analyze customer reviews for electronic products on Amazon in order to answer key business questions about consumer sentiment, the impact of product features, and the relationship between review characteristics and how helpful reviews are found by other customers.
+
+```{r}
+#install.packages("textstem")
+```
+
+## Load necessary libraries
+```{r}
+library(jsonlite)
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+library(scales)
+library(readr)
+library(forcats)
+library(stringi)
+library(stringr)
+#library(rJava)
+library(ggthemes)
+library(tm)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(tidytext)
+library(lubridate)
+library(dplyr)
+library(knitr)
+library(stopwords)
+library(textstem)
+```
+
+
+# Dataset Extraction
+
+We obtained our dataset from the website: https://amazon-reviews-2023.github.io/ 
+The site contains a large amount of data to utilize, ranging from 1996 to 2023 and it is organized into set categories. The area of interest for this exercise will be from the category of Electronics, utilizing both review data and product metadata from data collected in 2023. In order to preserve computer space while still obtaining sufficient data, we will extract a sample of 20,000 reviews for the project. 
+
+## Sampling Method and Joining Datasets
+
+To create a representative sample of 20,000 Amazon Electronics reviews for our analysis, we used stratified random sampling based on two key review characteristics: rating (the number of stars given by the reviewer) and helpfulness (whether the review received any helpful votes, recorded as a binary indicator).
+
+We used Colab Notebook along with Python code to extract the sample from the entire dataset. Here's how the process worked:
+
+1. First, we divided the full dataset into groups (strata) defined by combinations of rating and helpfulness, ensuring each stratum contained reviews sharing those two characteristics.
+
+2. We then calculated how many reviews from each group to include, so that our final sample would represent each group proportionally to its presence in the full dataset.
+
+3. Finally, within each group, we randomly selected the required number of reviews and merged the dataset with the product metadata information. The final dataset was exported as a CSV file to use in Positron.
+
+This process can be found in detail in the file "Sampling_Amazon_Reviews.py"
+
+## Importing Final Dataset
+
+We load the CSV file into R as a data frame called 'data' to organize the dataset into rows and columns.
+```{r}
+# Load CSV file
+amazon_merged <- read.csv("C:/AU - Ms Analytics/Fall 2025/KSB 620-621 - Practicum/data/merged_electronics_sample.csv")
+```
+
+# Data Validation
+
+```{r}
+cat("\n DATASET:", nrow(amazon_merged), "rows,", ncol(amazon_merged), "columns\n\n")
+```
+
+```{r}
+# 1. Column type check
+type_report <- sapply(amazon_merged, class)
+print(type_report)
+```
+
+```{r}
+# 2. Missing values
+missing_count <- sapply(amazon_merged, function(x) sum(is.na(x)))
+missing_pct <- round((missing_count/nrow(amazon_merged))*100, 2)
+missing_report <- data.frame(Missing_Count = missing_count, Missing_Percent = missing_pct)
+print(missing_report)
+```
+
+```{r}
+# 3. Duplicate rows
+dup_rows <- amazon_merged[duplicated(amazon_merged), ]
+cat("\n Duplicate Rows Found:", nrow(dup_rows), "\n")
+```
+
+```{r}
+# 4. Blank text check
+text_cols <- names(amazon_merged)[sapply(amazon_merged, is.character)]
+blank_text_report <- sapply(amazon_merged[text_cols], function(x) sum(str_trim(x) == "" | is.na(x)))
+print("\n Blank or empty text values:")
+print(blank_text_report)
+```
+
+```{r}
+# 6. Numeric validity check
+num_cols <- names(amazon_merged)[sapply(amazon_merged, is.numeric)]
+cat("\n Numeric column summary:\n")
+print(summary(amazon_merged[num_cols]))
+
+# Flag negatives or zero values
+neg_zero_report <- sapply(amazon_merged[num_cols], function(x) sum(x <= 0, na.rm = TRUE))
+cat("\n Count of zero or negative values in numeric columns:\n")
+print(neg_zero_report)
+```
+
+```{r}
+# 8. Timestamp Detection, Parsing & Validation
+time_cols <- names(amazon_merged)[str_detect(tolower(names(amazon_merged)), "date|time|created|updated|timestamp")]
+invalid_timestamps <- list()
+future_timestamps <- list()
+for (col in time_cols) {
+  parsed <- parse_date_time(amazon_merged[[col]], orders = c("ymd HMS","ymd HM","ymd","mdy HMS","mdy HM","mdy"), tz = "UTC")
+  invalid_timestamps[[col]] <- sum(is.na(parsed))
+  future_timestamps[[col]] <- sum(parsed > Sys.time(), na.rm = TRUE)
+  amazon_merged[[col]] <- parsed
+}
+cat("\n Invalid timestamp count:\n")
+print(invalid_timestamps)
+cat("\n Timestamps in the future (data integrity issue):\n")
+print(future_timestamps)
+```
+
+
+# Strategy for Missing Values and Outliers
+
+We will start by checking for NAs in our main variables of interest:
+
+```{r}
+sum(is.na(amazon_merged$text))
+sum(is.na(amazon_merged$rating))
+sum(is.na(amazon_merged$parent_asin))
+sum(is.na(amazon_merged$helpful_vote))
+sum(is.na(amazon_merged$main_category))  
+sum(is.na(amazon_merged$store))  
+sum(is.na(amazon_merged$price))  # 8,314 NAs
+
+```
+
+Since Price is the only variable of interest with a significant amount of missing values, we consider that imputing missing price values using a random forest model is the best strategy for our project. Unlike simple mean or median imputation, random forests utilize patterns found in available metadata (such as category, features, ratings, and product details) to make more accurate predictions for missing values.
+
+## Price Imputation
+
+We separate the data into 'train_data' with known prices and 'missing_data' with missing prices for predictive modeling.
+
+```{r}
+# Rows with known prices
+train_data <- subset(amazon_merged, !is.na(price))
+
+# Rows with missing prices
+missing_data <- subset(amazon_merged, is.na(price))
+```
+
+We define the predictor variables 'rating', 'average_rating', 'rating_number', and 'main_category' to estimate price.
+
+```{r}
+predictors <- c("rating", "average_rating", "rating_number", "main_category")
+```
+
+We train a Random Forest regression model using the selected predictors to estimate price, excluding any rows with missing predictor values.
+
+```{r}
+set.seed(123)
+# Train model to predict price
+rf_model <- randomForest(price ~ rating + average_rating + rating_number + main_category,
+                         data = train_data, na.action = na.omit)
+```
+
+We predict the missing prices using the trained Random Forest model and combine the results with the training data.
+
+```{r}
+missing_data$price <- predict(rf_model, newdata = missing_data)
+amazon_merged_vf <- rbind(train_data, missing_data)
+
+summary(amazon_merged_vf)
+```
+
+
+# Price Outliers
+
+We visualize and identify potential outliers in the 'price' column using a boxplot and the IQR method.
+
+```{r}
+# Boxplot to visually inspect outliers
+boxplot(amazon_merged_vf$price, main = "Boxplot of Price", col = "lightblue", horizontal = TRUE)
+
+# Identify outliers using the IQR method
+Q1 <- quantile(amazon_merged_vf$price, 0.25, na.rm = TRUE)
+Q3 <- quantile(amazon_merged_vf$price, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+price_outliers <- amazon_merged_vf$price[amazon_merged_vf$price < (Q1 - 1.5*IQR) | amazon_merged_vf$price > (Q3 + 1.5*IQR)]
+
+# Print the outlier values for review
+price_outliers
+```
+
+We remove rows from the dataset where the price is extremely high or extremely low to reduce the impact of outliers.
+
+```{r}
+amazon_merged_vf <- subset(amazon_merged_vf, price <= 200)
+# Verify the removal by checking the maximum price
+max(amazon_merged_vf$price, na.rm = TRUE)
+
+amazon_merged_vf <- subset(amazon_merged_vf, price >= 5)
+# Verify the new minimum price
+min(amazon_merged_vf$price)
+
+
+# Visualization to validate outliers have been handeled correctly
+boxplot(amazon_merged_vf$price, main = "Boxplot of Price After Removing Outliers", 
+        col = "lightgreen", horizontal = TRUE)
+
+# Get a quick summary of the dataset
+summary(amazon_merged_vf)
+
+```
+
+# Variable Regrouping and Creation
+
+```{r}
+# Create a new timestamp in date format
+#str(amazon_merged$timestamp)
+#amazon_merged$timestamp <- as.numeric(amazon_merged$timestamp)
+#amazon_merged$review_date <- as.Date(as.POSIXct(amazon_merged$timestamp / 1000, origin = "1970-01-01", tz = "UTC"))
+
+
+# Binary for heplful: Yes/No
+amazon_merged_vf <- amazon_merged_vf %>%
+  mutate(helpful_cat = case_when(
+    helpful_vote == 0 ~ "Not Helpful",
+    helpful_vote > 0 ~ "Helpful"
+  ))
+
+amazon_merged_vf %>%
+  count(helpful_cat) 
+
+# Grouping Amazon stores
+amazon_merged_vf <- amazon_merged_vf %>%
+  mutate(store_grouped = case_when(
+    grepl("Amazon", store, ignore.case = TRUE) ~ "Amazon",
+    TRUE ~ store
+  ))
+
+# Creating a Big/Small Brand Variable:
+amazon_merged_vf <- amazon_merged_vf %>%
+  mutate(brand_group = case_when(
+    store_grouped %in% c("Dell", "Lenovo", "HP", "Nikon", "Bose", "SAMSUNG", "Canon",
+                         "Sony", "Apple", "Microsoft", "Panasonic", "Logitech", "ASUS", "Fujifilm", 
+                         "StarTech", "TP-Link", "SanDisk", "Garmin", "NETGEAR", "Amazon", 
+                         "Western Digital", "Seagate") ~ "Big Brand",
+    TRUE ~ "Small Brand"
+  ))
+
+amazon_merged_vf %>%
+  count(brand_group) %>%
+  arrange(desc(n))
+
+# Grouping Product Cateogry variable into less groups
+library(purrr)
+
+amazon_merged_vf <- amazon_merged_vf %>%
+  mutate(
+    categories_vec = strsplit(gsub("\\[|\\]", "", categories), ",\\s*"),
+    categories_vec = map(categories_vec, ~ str_replace_all(.x, "^'|'$", "")),
+    main_specific   = case_when(
+      main_category == "All Electronics" ~ map_chr(categories_vec, ~ if (length(.x) >= 2) .x[2] else "Other Electronics"),
+      TRUE ~ main_category
+    )
+  )
+
+amazon_merged_vf %>%
+  count(main_specific) %>%
+  arrange(desc(n))
+
+
+amazon_merged_vf <- amazon_merged_vf %>%
+  mutate(category_grouped = case_when(
+
+    # Computers & Accessories
+    main_specific %in% c("Computers", "Computers & Accessories") ~ "Computers",
+
+    # Phones & Accessories
+    main_specific %in% c("Cell Phones & Accessories", "Wearable Technology") ~ "Cell Phones",
+
+    # Camera & related
+    main_specific %in% c("Camera & Photo") ~ "Camera",
+
+    # Audio (Home, Portable, etc.)
+    main_specific %in% c("Home Audio & Theater", "Home Audio", "Portable Audio & Accessories", "Portable Audio & Video", "Speakers", "Headphones", "Home Audio") ~ "Audio",
+
+    # Video Accessories
+    main_specific %in% c("Television & Video",
+                           "Video Projectors",
+                           "Gaming Projectors") ~ "Video",
+
+    # Automotive, Car, GPS, Navigation
+    main_specific %in% c("Car Electronics", "Car & Vehicle Electronics", "Automotive", "GPS & Navigation", "GPS", "Household Batteries", "Power Accessories", "Car Electronics") ~ "Auto & GPS",
+
+    # Amazon brand products
+    main_specific %in% c("Amazon Devices", "Amazon Home", "Amazon Fire TV", "AmazonBasics Accessories") ~ "Amazon Brand",
+
+    # Apple products
+    main_specific %in% c("Apple Products") ~ "Apple",
+
+    # Hobbies
+    main_specific %in% c("Books", "Toys & Games", "Arts, Crafts & Sewing", "Musical Instruments", "Video Games", "Sports & Outdoors", "Musical Instruments", "Sports & Outdoors") ~ "Hobbies",
+
+    # Home, Office, Others
+    main_specific %in% c("Tools & Home Improvement", "Industrial & Scientific", "Office Products", "Software", "Pet Supplies", "Baby", "Industrial & Scientific", "Accessories & Supplies", "Tools & Home Improvement", "Office Products") ~ "Home & Office",
+
+    # Health, personal care, beauty
+    main_specific %in% c("Health & Personal Care", "All Beauty", "AMAZON FASHION") ~ "Health & Beauty",
+
+    # NA and everything else
+    is.na(main_specific) ~ "Other",
+    TRUE ~ "Other"
+  ))
+
+amazon_merged_vf %>%
+  count(category_grouped) %>%
+  arrange(desc(n))
+
+
+# Create Review Lenght variable by tokens
+amazon_merged_vf <- amazon_merged_vf %>%
+  mutate(review_word_count = str_count(text, "\\S+"))
+
+```
+
+
+# Exploratory Data Analysis
+
+## HELPFUL VOTE
+
+```{r}
+
+range(amazon_merged_vf$helpful_vote)
+
+# Logging the variable to transforme
+amazon_merged_vf$helpful_vote_log <- log1p(amazon_merged_vf$helpful_vote)
+
+# Plot histogram
+ggplot(amazon_merged_vf, aes(x = helpful_vote_log)) +
+  geom_histogram(binwidth = 0.5, fill = "steelblue", color = "white", alpha = 0.7) +
+  labs(
+    title = "Histogram of Helpful Votes",
+    x = "Helpful Vote (logged)",
+    y = "Frequency"
+  ) +
+  theme_tufte(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(size = 20)
+  )
+
+# Distribution
+ggplot(amazon_merged_vf, aes(x = helpful_cat)) +
+  geom_bar(fill = "steelblue") +
+  geom_text(stat = "count", aes(label = comma(..count..)), vjust = -0.5) +
+  labs(
+    title = "Reviews found Helpful",
+    x = "Helpful",
+    y = "Count"
+  ) +
+  theme_tufte(base_size = 16) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  coord_cartesian(clip = "off") +
+  theme(
+    axis.text.x  = element_text(size = 14),
+    axis.text.y  = element_blank(),
+    axis.ticks.y   = element_blank(),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_blank(),
+    plot.title   = element_text(size = 20)
+  )
+
+```
+
+## Review Length
+
+```{r}
+# This shows the minimum and maximum values
+range(amazon_merged_vf$review_word_count)
+
+# Plot histogram
+ggplot(amazon_merged_vf, aes(x = review_word_count)) +
+  geom_histogram(binwidth = 10, fill = "steelblue", color = "white", alpha = 0.7) +
+  labs(
+    title = "Histogram of Reviews Length",
+    x = "Review Length (word count)",
+    y = "Frequency"
+  ) +
+  theme_tufte(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(size = 20)
+  )
+
+
+# Logging the variable to transforme it and address skewness: 
+amazon_merged_vf$review_word_count_log <- log1p(amazon_merged_vf$review_word_count)
+
+# Plot histogram
+ggplot(amazon_merged_vf, aes(x = review_word_count_log)) +
+  geom_histogram(binwidth = 0.5, fill = "steelblue", color = "white", alpha = 0.7) +
+  labs(
+    title = "Histogram of Reviews Length (Logged)",
+    x = "Review Length (word count, log scale)",
+    y = "Frequency"
+  ) +
+  theme_tufte(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(size = 20)
+  )
+
+```
+
+## Categories
+
+```{r}
+
+ggplot(amazon_merged_vf,
+       aes(x = fct_rev(fct_infreq(category_grouped)))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "2023: Electronic Categories",
+    x = "Count",
+    y = NULL
+  ) +
+  theme_tufte(base_size = 16) +
+  coord_flip() +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text  = element_text(size = 14),
+    plot.title = element_text(size = 20)
+  )
+
+```
+
+
+# Variable Transformations
+
+```{r}
+# Logging the review length variable to transforme it and address skewness: 
+amazon_merged_vf$review_word_count_log <- log1p(amazon_merged_vf$review_word_count)
+
+# Logging the helpful votes variable to transforme
+amazon_merged_vf$helpful_vote_log <- log1p(amazon_merged_vf$helpful_vote)
+
+# Logging the price variable to transforme it and address skewness: 
+amazon_merged_vf$price_log <- log1p(amazon_merged_vf$price)
+
+```
+
+
+# Text Manipulation 
+
+We combine all review-related text (title + body) into one field and keep product metadata separate for later joins
+
+```{r}
+amazon_text <- amazon_merged_vf %>%
+  select(user_id, asin, rating, helpful_vote, verified_purchase,
+         title_x, text, features, description, details, store, categories) %>%
+  mutate(
+    # combine review title + body
+    review_text = str_c(title_x, text, sep = ". "),
+    
+    #combine product text info
+    product_text = str_c(features, description, details, sep = ". "))
+
+```
+
+We replaced common contractions before punctuation removal
+```{r}
+
+amazon_text <- amazon_text %>%
+  mutate(review_text = str_replace_all(review_text, "n’t", " not"),
+         review_text = str_replace_all(review_text, "’t", " not"),
+         review_text = str_replace_all(review_text, "n't", " not"),
+         review_text = str_replace_all(review_text, "’re", " are"),
+         review_text = str_replace_all(review_text, "’ll", " will"),
+         review_text = str_replace_all(review_text, "’ve", " have"),
+         review_text = str_replace_all(review_text, "’d", " would"),
+         review_text = str_replace_all(review_text, "’m", " am"))
+
+```
+
+Removing punctuations and loswercasing text
+```{r}
+amazon_text <- amazon_text %>%
+  mutate(review_text = str_to_lower(review_text),
+         review_text = str_replace_all(review_text, "[^a-z\\s]", " "),
+         review_text = str_squish(review_text))
+
+```
+
+Removing common HTML entities
+```{r}
+amazon_text <- amazon_text %>%
+  mutate(review_text = str_replace_all(review_text, "(?i)<br\\s*/?>", " ")) %>%  
+  mutate(review_text = str_replace_all(review_text, "&nbsp;", " "))              
+```
+
+# Feature Engineering for Helpfulness Modeling
+
+Goal:
+Create predictors that capture textual, structural,
+and product-related characteristics of reviews so we
+can model what makes a review "Helpful" vs "Not Helpful".
+
+Variables created here:
+- helpful_flag : target (Helpful / Not Helpful)
+- review_word_count_log : log-transformed review length
+- title_word_count_log : log-transformed title length
+- includes_image : whether the review includes images
+- category_grouped : grouped product category (factor)
+- brand_group : Big vs Small brand (factor)
+
+# Adding additional columns
+```{r}
+# Target variable: Helpful vs Not Helpful
+amazon_merged_vf <- amazon_merged_vf %>%
+mutate(
+helpful_flag = if_else(helpful_vote > 0, "Helpful", "Not Helpful"),
+helpful_flag = factor(helpful_flag, levels = c("Not Helpful", "Helpful"))
+)
+
+#Review length in words (body) + log transform
+amazon_merged_vf <- amazon_merged_vf %>%
+mutate(
+review_word_count = str_count(text, "\\S+"),
+review_word_count_log = log1p(review_word_count)
+)
+
+#Title length in words + log transform
+amazon_merged_vf <- amazon_merged_vf %>%
+mutate(
+title_word_count = str_count(title_x, "\\S+"),
+title_word_count_log = log1p(title_word_count)
+)
+
+#Includes image: images column is "[]" when empty
+amazon_merged_vf <- amazon_merged_vf %>%
+mutate(
+includes_image = if_else(
+is.na(images) | images == "[]" | str_trim(images) == "",
+0L, # no image
+1L # at least one image
+)
+)
+
+#Ensure grouping variables are factors
+amazon_merged_vf <- amazon_merged_vf %>%
+mutate(
+category_grouped = factor(category_grouped),
+brand_group = factor(brand_group)
+)
+
+amazon_merged_vf %>%
+  count(includes_image)
+
+
+# bivariate plot
+ggplot(amazon_merged_vf,
+       aes(x = factor(
+      includes_image,
+      levels = c(0, 1),
+      labels = c("No", "Yes")
+    ), fill = helpful_cat)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(
+    values = c(
+      "Helpful"    = "steelblue4",
+      "Not Helpful" = "lightsteelblue2"
+    )
+  ) +
+  labs(
+    x = "Includes Image",
+    y = "Share of reviews",
+    fill = "Helpfulness"
+  ) +
+  theme_tufte(base_size = 16) +
+  coord_flip() +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text  = element_text(size = 14),
+    plot.title = element_text(size = 20)
+  )
+
+```
+
+# Data Partitioning
+
+Setting our training and testing sets from our data: 
+
+```{r}
+set.seed(123)
+
+tr.size <- 0.7
+train <- sample(nrow(amazon_merged_vf), tr.size * nrow(amazon_merged_vf))
+
+amazon.train <- amazon_merged_vf[train, ]
+nrow(amazon.train)
+
+amazon.test <- amazon_merged_vf[-train, ]
+nrow(amazon.test)
+
+
+amazon.train <- amazon.train %>%
+  mutate(
+    helpful_flag_num = if_else(helpful_flag == "Helpful", 1, 0)
+  )
+
+amazon.train %>%
+  count(helpful_flag_num)
+
+amazon.test <- amazon.test %>%
+  mutate(
+    helpful_flag_num = if_else(helpful_flag == "Helpful", 1, 0)
+  )
+
+```
+
+# Logistic Regression
+
+Logistic Regression Model:
+Predicting whether a review is Helpful vs Not Helpful
+using:
+- review_word_count_log : length of review (log-transformed)
+- category_grouped : grouped product category
+- brand_group : Big vs Small brand
+- rating : star rating
+- title_word_count_log : length of review title (log-transformed)
+- includes_image : whether review includes an image (0/1)
+- price_log : product price (log-transformed)
+
+This model helps us understand which features are associated
+with higher odds of a review being rated as helpful.
+```{r}
+logit_model <- glm(
+  helpful_flag ~ review_word_count_log +
+    category_grouped +
+    brand_group +
+    rating +
+    title_word_count_log +
+    includes_image +
+    price_log,
+  data = amazon.train,
+  family = binomial
+)
+summary(logit_model)
+
+# Get predicted probabilities from the best model
+predicted_probs <- predict(logit_model, newdata = amazon.test, type = "response")
+
+# Assign predicted class based on threshold 0.5
+predicted_class <- ifelse(predicted_probs > 0.5, 1, 0)
+
+# Compare to actual values and calculate confusion matrix
+actual_class <- amazon.test$helpful_flag
+table(predicted_class, actual_class)
+
+# Assign values from confusion matrix
+TP <- 223
+FN <- 907
+FP <- 133
+TN <- 4423
+
+# Statistics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision <- TP / (TP + FP)
+npv <- TN / (TN + FN)
+f1 <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+# Display
+cat("Accuracy:", accuracy, "\n")
+cat("Sensitivity (Recall):", sensitivity, "\n")
+cat("Specificity:", specificity, "\n")
+cat("Precision:", precision, "\n")
+cat("NPV:", npv, "\n")
+cat("F1 Score:", f1, "\n")
+
+```
+
+- ROC and AUC
+
+```{r}
+
+# Calculate ROC curve and AUC
+library(pROC)
+roc_obj <- roc(amazon.test$helpful_flag_num, predicted_probs)  # Make sure helpful_flag is numeric (0/1)
+auc_value <- auc(roc_obj)
+
+# Plot ROC curve (optional)
+plot(roc_obj, main = "ROC Curve")
+
+# Print AUC
+print(auc_value)
+
+# Highest point of ROC Curve
+
+closest_pt <- coords(roc_obj,
+                     x = "best",
+                     best.method = "closest.topleft",
+                     ret = c("threshold", "sensitivity", "specificity"))
+closest_pt
+
+```
+
+Tests to use to determine if great model:
+A. AIC — lower is better
+B. Null vs Residual Deviance - Large drop → good model
+C. Likelihood Ratio Test (Chi-square Test) - If p < 0.05, your predictors collectively improve the model significantly.
+D. Check Individual Predictor Significance - p-values < 0.05 → statistically significant predictors AND Signs matter
+E. Check Odds Ratios (Easier to interpret) - OR > 1 → increases helpfulness and vice versa and CI crossing 1 → predictor NOT strong
+F. Confusion Matrix - High overall accuracy AND High true positives and true negatives
+G. Accuracy - 0.70–0.80 = acceptable, 0.80–0.90 = good, 0.90+ = suspiciously high (may be overfitting OR unbalanced classes)
+H. ROC Curve + AUC (best metric) - 0.5 → worthless, 0.6–0.7 → weak, 0.7–0.8 → acceptable, 0.8–0.9 → good, 0.9+ → excellent
+
+## All Subsets Selection
+
+```{r}
+
+# Install package if not already
+# install.packages("bestglm")
+library(bestglm)
+
+# Prepare your data so 'helpful_flag' is the last column
+# Example: amazon.train should ensure helpful_flag is last
+
+amazon.train_subsets <- amazon.train[, c("review_word_count_log",
+    "category_grouped",
+    "brand_group",
+    "rating",
+    "title_word_count_log",
+    "includes_image",
+    "price_log",
+    "helpful_flag")]
+
+# Run bestglm for exhaustive best subsets logistic regression
+best_model <- bestglm(
+    amazon.train_subsets,
+    family = binomial,        # specify logistic regression
+    IC = "AIC",               # use AIC for model selection
+    method = "exhaustive"     # makes it try all subsets
+)
+
+# View summary of best selected model
+summary(best_model$BestModel)
+```
+
+Calculating fit statistics
+
+- AIC:
+```{r}
+# Caculate the AIC
+AIC(best_model$BestModel)
+```
+
+- Confusion Matrix:
+```{r}
+# Get predicted probabilities from the best model
+predicted_probs <- predict(best_model$BestModel, newdata = amazon.test, type = "response")
+
+# Assign predicted class based on threshold 0.5
+predicted_class <- ifelse(predicted_probs > 0.5, 1, 0)
+
+# Compare to actual values and calculate confusion matrix
+actual_class <- amazon.test$helpful_flag
+
+table(predicted_class, actual_class)
+
+# Assign values from confusion matrix
+TP <- 909
+FN <- 221
+FP <- 133
+TN <- 4423
+
+# Statistics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision <- TP / (TP + FP)
+npv <- TN / (TN + FN)
+f1 <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+# Display
+cat("Accuracy:", accuracy, "\n")
+cat("Sensitivity (Recall):", sensitivity, "\n")
+cat("Specificity:", specificity, "\n")
+cat("Precision:", precision, "\n")
+cat("NPV:", npv, "\n")
+cat("F1 Score:", f1, "\n")
+```
+
+- ROC and AUC
+
+```{r}
+# Calculate ROC curve and AUC
+library(pROC)
+roc_obj <- roc(amazon.test$helpful_flag_num, predicted_probs)  # Make sure helpful_flag is numeric (0/1)
+auc_value <- auc(roc_obj)
+
+# Plot ROC curve (optional)
+plot(roc_obj, main = "ROC Curve")
+
+# Print AUC
+print(auc_value)
+
+# Highest point of ROC Curve
+
+closest_pt <- coords(roc_obj,
+                     x = "best",
+                     best.method = "closest.topleft",
+                     ret = c("threshold", "sensitivity", "specificity"))
+closest_pt
+
+```
+
+## Weighted Logistic Regression
+
+```{r}
+weight_not_helpful <- 1
+weight_helpful <- sum(amazon.train$helpful_flag_num == 0) / sum(amazon.train$helpful_flag_num == 1)
+weights <- ifelse(amazon.train$helpful_flag_num == 1, weight_helpful, weight_not_helpful)
+
+# Example: Give 4x the weight to "Helpful" vs "Not Helpful"
+#weights <- ifelse(amazon.train$helpful_flag == 1, 4, 1)
+
+logit_weighted <- glm(
+  helpful_flag ~ review_word_count_log +
+    category_grouped +
+    rating +
+    includes_image +
+    price_log,
+  data = amazon.train,
+  family = binomial,
+  weights = weights
+)
+
+summary(logit_weighted)
+
+```
+
+- Confusion Matrix:
+```{r}
+# Get predicted probabilities from the best model
+predicted_probs_w <- predict(logit_weighted, newdata = amazon.test, type = "response")
+
+# Assign predicted class based on threshold 0.5
+predicted_class_w <- ifelse(predicted_probs_w > 0.5, 1, 0)
+
+# Compare to actual values and calculate confusion matrix
+actual_class <- amazon.test$helpful_flag
+table(predicted_class_w, actual_class)
+
+# Assign values from confusion matrix
+TP <- 795
+FN <- 335
+FP <- 1434
+TN <- 3122
+
+# Statistics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision <- TP / (TP + FP)
+npv <- TN / (TN + FN)
+f1 <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+# Display
+cat("Accuracy:", accuracy, "\n")
+cat("Sensitivity (Recall):", sensitivity, "\n")
+cat("Specificity:", specificity, "\n")
+cat("Precision:", precision, "\n")
+cat("NPV:", npv, "\n")
+cat("F1 Score:", f1, "\n")
+
+```
+
+- AUC
+```{r}
+# Calculate ROC curve and AUC
+roc_obj_w <- roc(amazon.test$helpful_flag_num, predicted_probs_w)  # Make sure helpful_flag is numeric (0/1)
+auc_value_w <- auc(roc_obj_w)
+
+# Plot ROC curve (optional)
+plot(roc_obj_w, main = "ROC Curve")
+
+# Print AUC
+print(auc_value_w)
+```
+
+
+## Interaction Model
+
+```{r}
+logit_interaction <- glm(
+helpful_flag ~ review_word_count_log +
+category_grouped +
+#brand_group +
+rating +
+#title_word_count_log +
+includes_image +
+price_log + 
+review_word_count_log * rating,
+data = amazon.train,
+family = binomial
+)
+summary(logit_interaction)
+
+## Fit Stats
+
+# Get predicted probabilities from the best model
+predicted_probs_int <- predict(logit_interaction, newdata = amazon.test, type = "response")
+
+# Assign predicted class based on threshold 0.5
+predicted_class_int <- ifelse(predicted_probs_int > 0.5, 1, 0)
+
+# Compare to actual values and calculate confusion matrix
+actual_class <- amazon.test$helpful_flag
+table(predicted_class_int, actual_class)
+
+# Assign values from confusion matrix
+TP <- 223
+FN <- 907
+FP <- 13
+TN <- 4425
+
+# Statistics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision <- TP / (TP + FP)
+npv <- TN / (TN + FN)
+f1 <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+# Display
+cat("Accuracy:", accuracy, "\n")
+cat("Sensitivity (Recall):", sensitivity, "\n")
+cat("Specificity:", specificity, "\n")
+cat("Precision:", precision, "\n")
+cat("NPV:", npv, "\n")
+cat("F1 Score:", f1, "\n")
+
+# Calculate ROC curve and AUC
+roc_obj_int <- roc(amazon.test$helpful_flag_num, predicted_probs_int)  # Make sure helpful_flag is numeric (0/1)
+auc_value_int <- auc(roc_obj_int)
+
+# Plot ROC curve (optional)
+plot(roc_obj_int, main = "ROC Curve")
+
+# Print AUC
+print(auc_value_int)
+
+
+```
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Random Forest
+
+Random Forest Classification Model:
+Predicting Helpful vs Not Helpful reviews using the same
+set of predictors as the logistic regression.
+
+Random Forest:
+- Captures nonlinear relationships and interactions
+- Provides variable importance measures
+- Complements the interpretable logistic model with a
+potentially more accurate, flexible classifier.
+```{r}
+library(randomForest)
+
+rf_helpful <- randomForest(
+  helpful_flag ~ review_word_count_log +
+    category_grouped +
+    brand_group +
+    rating +
+    title_word_count_log +
+    includes_image + verified_purchase + 
+    price_log,
+  data = amazon.train,
+  ntree = 500,
+  importance = TRUE
+)
+
+rf_helpful
+varImpPlot(rf_helpful)
+importance(rf_helpful)
+
+```
+
+```{r}
+
+predictor_columns <- c(
+  "review_word_count_log",
+  "category_grouped",
+  "brand_group",
+  "rating",
+  "title_word_count_log",
+  "includes_image", "verified_purchase", 
+  "price_log"
+)
+
+# Try different 'mtry' values and number of trees
+tune_results <- tuneRF(
+  x = amazon.train[, predictor_columns],  
+  y = amazon.train$helpful_flag,      
+  stepFactor = 1.5,
+  improve = 0.01,
+  ntreeTry = 500,  # Try with more trees
+  trace = TRUE
+)
+
+# Fit a random forest with a selected 'mtry'
+rf_model <- randomForest(
+  helpful_flag ~ review_word_count_log +
+    category_grouped +
+    brand_group +
+    rating +
+    title_word_count_log +
+    includes_image + verified_purchase +
+    price_log,
+  data = amazon.train,
+  ntree = 500,         # or optimal value found
+  mtry = tune_results[which.min(tune_results[,2]), 1]  # minimum OOB error
+)
+
+rf_model
+varImpPlot(rf_model)
+
+```
+
+## Weighted RF
+
+```{r}
+
+# Set weights: higher for "Helpful" since it's the minority class
+table(amazon.train$helpful_flag)
+weight_not_helpful <- 1
+weight_helpful <- 10470 / 2795  # ~3.745975
+
+# Fit the weighted random forest model
+rf_weighted <- randomForest(
+  helpful_flag ~ review_word_count_log +
+    category_grouped +
+    brand_group +
+    rating +
+    title_word_count_log +
+    includes_image + verified_purchase +
+    price_log,
+  data = amazon.train,
+  ntree = 500,
+  classwt = c("Not Helpful" = weight_not_helpful, "Helpful" = weight_helpful)
+)
+
+rf_weighted
+importance(rf_weighted)
+varImpPlot(rf_weighted)
+
+```
+
+Calculating fit statistics
+
+- Confusion Matrix:
+```{r}
+# Predict probabilities for the positive class (e.g., "Helpful")
+predicted_probs_rfw <- predict(rf_weighted, newdata = amazon.test, type = "prob")[, "Helpful"]
+# Now create binary predictions
+predicted_class_rfw <- ifelse(predicted_probs_rfw > 0.5, 1, 0)
+
+# Compare to actual values and calculate confusion matrix
+actual_class <- amazon.test$helpful_flag
+
+table(predicted_class_rfw, actual_class)
+
+# Assign values from confusion matrix
+TP <- 817
+FN <- 313
+FP <- 2157
+TN <- 2399
+
+# Statistics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision <- TP / (TP + FP)
+npv <- TN / (TN + FN)
+f1 <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+# Display
+cat("Accuracy:", accuracy, "\n")
+cat("Sensitivity (Recall):", sensitivity, "\n")
+cat("Specificity:", specificity, "\n")
+cat("Precision:", precision, "\n")
+cat("NPV:", npv, "\n")
+cat("F1 Score:", f1, "\n")
+```
+
+With ntree = 500
+Accuracy: 0.6869205 
+Sensitivity (Recall): 0.6930233 
+Specificity: 0.6852913 
+Precision: 0.3702217 
+NPV: 0.8931906 
+F1 Score: 0.4826212 
+
+With ntree = 1000
+Accuracy: 0.8167429 
+Sensitivity (Recall): 0.239823 
+Specificity: 0.9598332 
+Precision: 0.5969163 
+NPV: 0.835818 
+F1 Score: 0.3421717 
+
+- ROC and AUC
+
+```{r}
+# Actual numeric labels for test set
+actual_labels <- amazon.test$helpful_flag_num  # 0 for "Not Helpful", 1 for "Helpful"
+
+# Calculate ROC curve and AUC
+roc_rf <- roc(actual_labels, predicted_probs_rfw)
+auc_rf <- auc(roc_rf)
+
+# Print AUC
+print(auc_rf)  # 0.745
+
+# (Optional) Plot ROC curve
+plot(roc_rf, main = "Random Forest ROC Curve")
+```
+
+## Variable Selection Weighted
+
+```{r}
+
+# Fit the weighted random forest model
+rf_selection_w <- randomForest(
+  helpful_flag ~ review_word_count_log +
+    category_grouped +
+   # brand_group +
+   # rating +
+    title_word_count_log +
+   # includes_image +
+    price_log,
+  data = amazon.train,
+  ntree = 500,
+  classwt = c("Not Helpful" = weight_not_helpful, "Helpful" = weight_helpful)
+)
+
+rf_selection_w
+importance(rf_selection_w)
+varImpPlot(rf_selection_w)
+
+```
+
+Fit statistics
+
+```{r}
+# Predict probabilities for the positive class (e.g., "Helpful")
+predicted_probs_rfvw <- predict(rf_selection_w, newdata = amazon.test, type = "prob")[, "Helpful"]
+# Now create binary predictions
+predicted_class_rfvw <- ifelse(predicted_probs_rfvw > 0.5, 1, 0)
+
+# Compare to actual values and calculate confusion matrix
+actual_class <- amazon.test$helpful_flag
+
+table(predicted_class_rfvw, actual_class)
+
+# Assign values from confusion matrix
+TP <- 283
+FN <- 847
+FP <- 305
+TN <- 4251
+
+# Statistics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision <- TP / (TP + FP)
+npv <- TN / (TN + FN)
+f1 <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+# Display
+cat("Accuracy:", accuracy, "\n")
+cat("Sensitivity (Recall):", sensitivity, "\n")
+cat("Specificity:", specificity, "\n")
+cat("Precision:", precision, "\n")
+cat("NPV:", npv, "\n")
+cat("F1 Score:", f1, "\n")
+
+```
+
+- ROC and AUC
+
+```{r}
+# Actual numeric labels for test set
+actual_labels <- amazon.test$helpful_flag_num  # 0 for "Not Helpful", 1 for "Helpful"
+
+# Calculate ROC curve and AUC
+roc_rf_vw <- roc(actual_labels, predicted_probs_rfvw)
+auc_rf_vw <- auc(roc_rf_vw)
+
+# Print AUC
+print(auc_rf_vw)  # 0.745
+
+# (Optional) Plot ROC curve
+plot(roc_rf_vw, main = "Random Forest ROC Curve")
+```
+
+
+A. Out-of-Bag (OOB) Error — Lower is better
+Random Forest provides OOB error automatically.
+This is RF’s built-in cross-validation.
+Lower OOB error = better performance.
+Compare to baseline (e.g., majority class rate).
+
+B. Test-Set Confusion Matrix — Shows real predictive power
+Look for:
+High true positives (Helpful correctly predicted)
+High true negatives (Not Helpful correctly predicted)
+Balanced performance (not predicting only the majority class)
+
+C. Accuracy — Good basic performance test
+Guidelines:
+0.70–0.80 = acceptable
+0.80–0.90 = good
+0.90+ = suspicious unless classes are well balanced
+Possible overfitting
+Or model is just predicting the majority class
+
+D. Precision, Recall, and F1 Score — Required if classes are imbalanced
+Precision Helpful: When RF predicts Helpful, how often is it correct?
+Recall Helpful: Of all Helpful reviews, how many did RF catch?
+F1 Score: Harmonic mean — balances precision and recall
+Interpretation:
+Low recall → model misses many Helpful reviews
+Low precision → lots of false Helpful predictions
+Higher F1 → better balanced model performance
+
+E. ROC Curve + AUC — Best single metric for classification quality
+Interpretation:
+0.5 → worthless (random guessing)
+0.6–0.7 → weak
+0.7–0.8 → acceptable
+0.8–0.9 → good
+0.9+ → excellent
+AUC matters more than accuracy in imbalanced data.
+
+F. Variable Importance — Ensures the model makes sense
+Look for:
+Important variables (review length, title length, rating, category) at the top
+Stable, interpretable rankings (no weird dominance by ID-like fields)
+If highly important variables match domain expectations → strong model
+
+G. Error Rate vs Number of Trees — Model stability test
+Inspect plot(rf_helpful) for:
+Error curve stabilizing → good model
+Wild fluctuations → unstable / not enough trees
+Continuous improvement without stabilizing → may need tuning
+
+H. Compare OOB Error vs. Test Error — Overfitting check
+Rules:
+Similar values → well-generalized model
+OOB much lower than test error → overfitting
+
+
+
+
+
+# Weighted Ridge 
+```{r}
+options(scipen = 4)
+library(glmnet)
+
+# Use your training data
+# amazon.train already created earlier
+
+# Design matrix and response
+x <- model.matrix(
+  helpful_flag_num ~ category_grouped + rating +
+    includes_image + price_log,
+  data = amazon.train
+)[, -1]
+
+y <- amazon.train$helpful_flag_num  # 0/1
+
+# Weights: give more weight to Helpful (minority)
+weight_not_helpful <- 1
+weight_helpful <- sum(amazon.train$helpful_flag == "Not Helpful") /
+                  sum(amazon.train$helpful_flag == "Helpful")
+w <- ifelse(amazon.train$helpful_flag == "Helpful",
+            weight_helpful,
+            weight_not_helpful)
+
+# Plain ridge path (no CV, just to plot)
+ridge.logit <- glmnet(
+  x, y,
+  alpha   = 0,          # Ridge
+  family  = "binomial",
+  weights = w
+)
+plot(ridge.logit)
+
+# 10-fold CV ridge
+set.seed(1)
+ridge.logit.cv10 <- cv.glmnet(
+  x, y,
+  alpha   = 0,
+  family  = "binomial",
+  weights = w,
+  nfolds  = 10
+)
+
+round(
+  cbind(
+    "Lambda" = ridge.logit.cv10$lambda,
+    "10FCV"  = ridge.logit.cv10$cvm
+  ),
+  digits = 3
+)
+
+# Best lambda and coefficients
+ridge.lambda.min <- ridge.logit.cv10$lambda.min
+coef(ridge.logit.cv10, s = "lambda.min")
+
+```
+
+## Ridge best lambda
+```{r}
+ridge.best.lambda <- ridge.logit.cv10$lambda.min
+min.cv.ridge      <- min(ridge.logit.cv10$cvm)
+
+round(
+  cbind(
+    "Best Lambda"     = ridge.best.lambda,
+    "Best Log Lambda" = log(ridge.best.lambda),
+    "Best 10FCV"      = min.cv.ridge
+  ),
+  digits = 3
+)
+
+```
+
+
+# Weighted Lasso 
+```{r}
+# Plain lasso path
+lasso.logit <- glmnet(
+  x, y,
+  alpha   = 1,          # LASSO
+  family  = "binomial",
+  weights = w
+)
+plot(lasso.logit)
+
+# 10-fold CV lasso
+set.seed(1)
+lasso.logit.cv10 <- cv.glmnet(
+  x, y,
+  alpha   = 1,
+  family  = "binomial",
+  weights = w,
+  nfolds  = 10
+)
+
+round(
+  cbind(
+    "Lambda" = lasso.logit.cv10$lambda,
+    "10FCV"  = lasso.logit.cv10$cvm
+  ),
+  digits = 3
+)
+
+# Best lambda and coefficients
+lasso.lambda.min <- lasso.logit.cv10$lambda.min
+coef(lasso.logit.cv10, s = "lambda.min")
+
+```
+
+## Best lasso lambda
+```{r}
+# Best lambda and CV value
+lasso.best.lambda <- lasso.logit.cv10$lambda.min
+min.cv.lasso      <- min(lasso.logit.cv10$cvm)
+
+round(
+  cbind(
+    "Best Lambda"     = lasso.best.lambda,
+    "Best Log Lambda" = log(lasso.best.lambda),
+    "Best 10FCV"      = min.cv.lasso
+  ),
+  digits = 3
+)
+```
+
+
+```{r}
+library(glmnet)
+library(pROC)      # for ROC/AUC
+library(caret)     # for confusionMatrix (optional)
+
+# Build test design matrix (same formula as train)
+x_test <- model.matrix(
+  helpful_flag_num ~ category_grouped + rating +
+    includes_image + price_log,
+  data = amazon.test
+)[, -1]
+
+y_test <- amazon.test$helpful_flag_num
+
+```
+
+## Ridge: probabilities, classes, confusion matrix, AUC
+```{r}
+
+
+# Predicted probabilities (Helpful = 1)
+pred_ridge_prob <- predict(
+  ridge.logit.cv10,
+  newx = x_test,
+  s    = "lambda.min",
+  type = "response"
+)
+
+# Class predictions at cutoff 0.5
+pred_ridge_class <- ifelse(pred_ridge_prob > 0.5, 1, 0)
+
+# Confusion matrix
+table(pred_ridge_class, y_test)
+
+# If you want accuracy, sensitivity, specificity, etc.
+confusionMatrix(
+  factor(pred_ridge_class, levels = c(0, 1)),
+  factor(y_test,          levels = c(0, 1))
+)
+
+# ROC and AUC
+roc_ridge <- roc(response = y_test, predictor = as.numeric(pred_ridge_prob))
+auc(roc_ridge)
+plot(roc_ridge, main = "Ridge ROC Curve")
+
+```
+
+## Lasso: probabilites, classes, conf matix, AUC
+
+
+```{r}
+
+
+pred_lasso_prob <- predict(
+  lasso.logit.cv10,
+  newx = x_test,
+  s    = "lambda.min",
+  type = "response"
+)
+
+pred_lasso_class <- ifelse(pred_lasso_prob > 0.5, 1, 0)
+
+table(pred_lasso_class, y_test)
+
+confusionMatrix(
+  factor(pred_lasso_class, levels = c(0, 1)),
+  factor(y_test,           levels = c(0, 1))
+)
+
+roc_lasso <- roc(response = y_test, predictor = as.numeric(pred_lasso_prob))
+auc(roc_lasso)
+plot(roc_lasso, main = "Lasso ROC Curve")
+
+```
+
+
+```{r}
+y_test <- amazon.test$helpful_flag_num
+pred_ridge_class <- ifelse(pred_ridge_prob > 0.5, 1, 0)
+
+```
+
+## weighted Ridge f1 
+```{r}
+TP <- sum(pred_ridge_class == 1 & y_test == 1)
+FP <- sum(pred_ridge_class == 1 & y_test == 0)
+FN <- sum(pred_ridge_class == 0 & y_test == 1)
+
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)
+F1        <- 2 * precision * recall / (precision + recall)
+
+precision; recall; F1
+
+```
+
+## weighted lasso f1
+```{r}
+TP_lasso <- sum(pred_lasso_class == 1 & y_test == 1)
+FP_lasso <- sum(pred_lasso_class == 1 & y_test == 0)
+FN_lasso <- sum(pred_lasso_class == 0 & y_test == 1)
+
+precision_lasso <- TP_lasso / (TP_lasso + FP_lasso)
+recall_lasso    <- TP_lasso / (TP_lasso + FN_lasso)
+F1_lasso        <- 2 * precision_lasso * recall_lasso /
+                   (precision_lasso + recall_lasso)
+
+cat("Lasso:  Precision =", precision_lasso,
+    " Recall =", recall_lasso,
+    " F1 =", F1_lasso, "\n")
+```
+
+# Model Comparison
+
+```{r}
+
+library(leaps)
+library(stargazer)
+
+summary(logit_weighted)
+stargazer(logit_weighted,
+          type = "html",      # "latex" or "html" for other outputs
+          title = "Best Model: Weighted Logistic Regression ",
+          dep.var.labels = "y",
+          align = TRUE,
+          no.space = TRUE,
+          single.row = TRUE,   # coeff and SE on one line
+
+           covariate.labels = c(
+              "Review Word Count (log)",
+              "Category - Apple products",
+              "Category - Audio",
+              "Category - Auto and GPS",
+              "Category - Camera and Photo",
+              "Category - Cell phones",
+              "Category - Computers",
+              "Category - Health and Beauty",
+              "Category - Hobbies",
+              "Category - Home and Office",
+              "Category - Other",
+              "Category - Video and TV",
+              "Rating",
+              "Includes Images",
+              "Price (log)"
+
+            ),
+
+          out = "best_model.html")
+
+stargazer(logit_model, logit_weighted,
+          type = "html",
+          column.labels = c("Full model", "Best subset"),
+          title = "Model Comparison: Full vs Best Subset",
+          out = "best_subset_models.html")
+
+```
